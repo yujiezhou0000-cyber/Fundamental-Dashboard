@@ -60,6 +60,16 @@ DISPLAY_TZ = "Europe/London"
 
 # 部分官方网站会拒绝没有浏览器 UA / Accept-Language 的请求（如新西兰联储、瑞士央行），
 # 云端服务器的出口 IP 段也更容易被这类反爬机制拦截，所以尽量把请求头伪装得更像真实浏览器。
+MANUAL_CHECK_URLS = {
+    # 瑞士央行 / 新西兰联储的官网都会拦截云端服务器的出口 IP（Streamlit Cloud、
+    # GitHub Actions 都试过，连伪装成真实浏览器的第三方数据源 Investing.com
+    # 也一样被拦截），属于对方基础设施层面的限制，代码层面已经没有再绕过去的
+    # 空间。给这两个国家一个手动查看当前数值的入口，而不是在页面上堆一堆
+    # 无法自动修复的报错信息。
+    "CH": "https://www.investing.com/rates-bonds/switzerland-2-year-bond-yield",
+    "NZ": "https://www.investing.com/rates-bonds/new-zealand-2-years-bond-yield",
+}
+
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

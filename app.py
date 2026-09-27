@@ -24,8 +24,8 @@ import analytics as an
 import charts as ch
 import data_sources as ds
 from config import (AUTO_REFRESH_OPTIONS, COUNTRIES, DEFAULT_AUTO_REFRESH, DEFAULT_HISTORY_MONTHS,
-                    DEFAULT_MOMENTUM_DAYS, DISPLAY_TZ, FX_TTL_SECONDS, STALE_BUSINESS_DAYS,
-                    YIELD_TTL_SECONDS)
+                    DEFAULT_MOMENTUM_DAYS, DISPLAY_TZ, FX_TTL_SECONDS, MANUAL_CHECK_URLS,
+                    STALE_BUSINESS_DAYS, YIELD_TTL_SECONDS)
 
 st.set_page_config(page_title="外汇宏观利差监控", layout="wide")
 TZ = ZoneInfo(DISPLAY_TZ)
@@ -98,16 +98,26 @@ def render(days: int, months: int, refresh_min: int) -> None:
             if lag > STALE_BUSINESS_DAYS:
                 stale.append(meta["name"])
             status_rows.append(dict(经济体=meta["name"], 货币=meta["ccy"], 数据源=r.source,
-                                    最新数据日期=f"{last:%Y-%m-%d}", 状态=state, 备注="；".join(r.errors)))
+                                    最新数据日期=f"{last:%Y-%m-%d}", 状态=state, 备注="；".join(r.errors),
+                                    手动查看=""))
+        elif code in MANUAL_CHECK_URLS:
+            # 官网 + 第三方兜底源都会被云端服务器的出口 IP 拦截，是对方基础设施层面的
+            # 限制，不是代码 bug，也没有再绕过去的空间了——与其在页面上堆一串没人看得懂
+            # 的报错堆栈，不如给一个手动查看当前数值的链接
+            status_rows.append(dict(经济体=meta["name"], 货币=meta["ccy"], 数据源="—", 最新数据日期="—",
+                                    状态="⚠️ 云端被拦截", 备注="该国数据源会拦截云端服务器，需手动查看→",
+                                    手动查看=MANUAL_CHECK_URLS[code]))
         else:
             status_rows.append(dict(经济体=meta["name"], 货币=meta["ccy"], 数据源="—", 最新数据日期="—",
-                                    状态="❌ 获取失败", 备注="；".join(r.errors)))
+                                    状态="❌ 获取失败", 备注="；".join(r.errors), 手动查看=""))
     fx_state = ("❌ " + "；".join(f"{c} {e}" for c, e in fx_errors.items())) if fx_errors else \
         (f"✅ 截至 {fx.index[-1]:%Y-%m-%d}" if not fx.empty else "❌ 没有数据")
     status_rows.append(dict(经济体="G10 汇率", 货币="—", 数据源="Yahoo Finance（yfinance）",
-                            最新数据日期=f"{fx.index[-1]:%Y-%m-%d}" if not fx.empty else "—", 状态=fx_state, 备注=""))
+                            最新数据日期=f"{fx.index[-1]:%Y-%m-%d}" if not fx.empty else "—", 状态=fx_state,
+                            备注="", 手动查看=""))
     with st.expander("数据来源与更新状态" + ("（有数据可能过期）" if stale else ""), expanded=bool(stale)):
-        st.dataframe(pd.DataFrame(status_rows), width="stretch", hide_index=True)
+        st.dataframe(pd.DataFrame(status_rows), width="stretch", hide_index=True,
+                    column_config={"手动查看": st.column_config.LinkColumn("手动查看", display_text="打开官网 ↗")})
     if n_ok == 0:
         st.error("所有收益率数据源都获取失败，请检查网络后点击侧边栏的“立即刷新数据”。")
         return
