@@ -58,11 +58,15 @@ STALE_BUSINESS_DAYS = 3
 # 页面显示的时区
 DISPLAY_TZ = "Europe/London"
 
-# 部分官方网站会拒绝没有浏览器 UA 的请求（如新西兰联储）
+# 部分官方网站会拒绝没有浏览器 UA / Accept-Language 的请求（如新西兰联储、瑞士央行），
+# 云端服务器的出口 IP 段也更容易被这类反爬机制拦截，所以尽量把请求头伪装得更像真实浏览器。
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     ),
     "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
 }

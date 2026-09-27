@@ -318,8 +318,13 @@ def fetch_ch_snb(start: date) -> pd.Series:
             continue
         seen_urls.add(url)
         try:
-            resp = http_get(url, timeout=40)
-            return _clean(_parse_snb_csv(resp.content.decode("utf-8-sig", errors="replace")), start)
+            # 部分反爬/限流规则会放行"看起来像从官网页面点过来"的请求，
+            # 带一个真实存在的 referer 页面比不带的裸接口请求更不容易被当成爬虫拦截
+            resp = http_get(url, timeout=40, headers={"Referer": "https://data.snb.ch/en/topics/ziredev/cube/rendoblid"})
+            series = _parse_snb_csv(resp.content.decode("utf-8-sig", errors="replace"))
+            if series.empty:
+                raise ValueError("接口返回了正常格式但没有任何数据行（可能是被限流/拦截后返回的空响应）")
+            return _clean(series, start)
         except Exception as e:
             errors.append(f"{label}: {type(e).__name__}: {str(e)[:120]}")
     raise ValueError("瑞士央行数据为空或解析失败：" + " | ".join(errors))
@@ -378,11 +383,14 @@ def _rbnz_2y(content: bytes) -> pd.Series:
 
 def fetch_nz_rbnz(start: date) -> pd.Series:
     errors = []
+    # RBNZ 的静态文件服务器对没有"从官网页面点进来"的直连请求会返回 403，
+    # 带上真实存在的来源页面 referer 更接近浏览器的正常访问路径
+    headers = {"Referer": "https://www.rbnz.govt.nz/statistics/series/exchange-and-interest-rates/wholesale-interest-rates"}
     for url in RBNZ_URLS:
         try:
-            return _clean(_rbnz_2y(http_get(url).content), start)
+            return _clean(_rbnz_2y(http_get(url, headers=headers).content), start)
         except Exception as e:
-            errors.append(f"{url.rsplit('/', 1)[-1]}: {e}")
+            errors.append(f"{url.rsplit('/', 1)[-1]}: {type(e).__name__}: {str(e)[:160]}")
     raise ValueError("新西兰联储数据获取失败：" + " | ".join(errors))
 
 
