@@ -37,6 +37,31 @@ def http_get(url: str, **kwargs) -> requests.Response:
     return resp
 
 
+try:
+    from curl_cffi import requests as _curl_cffi_requests  # type: ignore
+except ImportError:  # 可选依赖，环境里还没装时优雅降级，调用方会自动换别的方案
+    _curl_cffi_requests = None
+
+
+def http_get_impersonate(url: str, **kwargs):
+    """用 curl_cffi 伪装成真实 Chrome 的 TLS/HTTP2 指纹发请求。
+
+    瑞士央行、新西兰联储这两个源的反爬机制实测跟 User-Agent/Referer 请求头
+    没关系（换了头也没用），更像是在 TLS 握手层面识别出 Python requests /
+    云端机房出口（Streamlit Cloud、GitHub Actions 都命中过同样的拦截特征）
+    再拦截或返回"格式正常但没数据"的空响应。curl_cffi 会用真实 Chrome 的
+    TLS/HTTP2 指纹发请求，而不是 Python 标准库那一套，有机会绕开这类指纹级
+    的拦截。没装这个可选依赖时直接抛错，调用方会把它当成"这个方案不可用"，
+    自动换下一个方案，不影响其它数据源。
+    """
+    if _curl_cffi_requests is None:
+        raise RuntimeError("curl_cffi 未安装，跳过 TLS 指纹伪装方案")
+    timeout = kwargs.pop("timeout", HTTP_TIMEOUT)
+    resp = _curl_cffi_requests.get(url, timeout=timeout, impersonate="chrome124", **kwargs)
+    resp.raise_for_status()
+    return resp
+
+
 def _clean(s: pd.Series, start: date | None = None) -> pd.Series:
     """统一清洗：转数值、去空值、按日期排序去重、截取起始日期之后。"""
     s = pd.to_numeric(s, errors="coerce").dropna()
@@ -304,30 +329,37 @@ def fetch_ca_boc(start: date) -> pd.Series:
 def fetch_ch_snb(start: date) -> pd.Series:
     """瑞士央行 rendoblid。实测带 fromDate 的请求可能返回空序列，所以再试一次限定到
     最近 3 年（数据量小、不易超时），最后才尝试不带日期的全量（1988 年至今，体积较大，
-    云端环境下可能因为超时或限流失败）。"""
+    云端环境下可能因为超时或限流失败）。每个 URL 先用 TLS 指纹伪装（更容易绕开云端
+    出口 IP 的拦截），失败了再退回普通请求。"""
     errors = []
     bounded_from = max(start, date.today() - timedelta(days=3 * 365))
-    attempts = [
+    urls = [
         ("按起始日期", f"https://data.snb.ch/api/cube/rendoblid/data/csv/en?fromDate={start:%Y-%m-%d}"),
         ("近三年", f"https://data.snb.ch/api/cube/rendoblid/data/csv/en?fromDate={bounded_from:%Y-%m-%d}"),
         ("全量", "https://data.snb.ch/api/cube/rendoblid/data/csv/en"),
     ]
+    getters = [
+        ("TLS 指纹伪装", http_get_impersonate),
+        ("普通请求", http_get),
+    ]
+    # 部分反爬/限流规则会放行"看起来像从官网页面点过来"的请求，
+    # 带一个真实存在的 referer 页面比不带的裸接口请求更不容易被当成爬虫拦截
+    ref_headers = {"Referer": "https://data.snb.ch/en/topics/ziredev/cube/rendoblid"}
     seen_urls = set()
-    for label, url in attempts:
+    for label, url in urls:
         if url in seen_urls:
             continue
         seen_urls.add(url)
-        try:
-            # 部分反爬/限流规则会放行"看起来像从官网页面点过来"的请求，
-            # 带一个真实存在的 referer 页面比不带的裸接口请求更不容易被当成爬虫拦截
-            resp = http_get(url, timeout=40, headers={"Referer": "https://data.snb.ch/en/topics/ziredev/cube/rendoblid"})
-            series = _parse_snb_csv(resp.content.decode("utf-8-sig", errors="replace"))
-            if series.empty:
-                raise ValueError("接口返回了正常格式但没有任何数据行（可能是被限流/拦截后返回的空响应）")
-            return _clean(series, start)
-        except Exception as e:
-            errors.append(f"{label}: {type(e).__name__}: {str(e)[:120]}")
-    raise ValueError("瑞士央行数据为空或解析失败：" + " | ".join(errors))
+        for g_label, getter in getters:
+            try:
+                resp = getter(url, timeout=40, headers=ref_headers)
+                series = _parse_snb_csv(resp.content.decode("utf-8-sig", errors="replace"))
+                if series.empty:
+                    raise ValueError("接口返回了正常格式但没有任何数据行（可能是被限流/拦截后返回的空响应）")
+                return _clean(series, start)
+            except Exception as e:
+                errors.append(f"{label}/{g_label}: {type(e).__name__}: {str(e)[:120]}")
+    raise ValueError("瑞士央行数据为空或解析失败：" + " | ".join(errors[:6]))
 
 
 def _parse_snb_csv(text: str) -> pd.Series:
@@ -386,12 +418,66 @@ def fetch_nz_rbnz(start: date) -> pd.Series:
     # RBNZ 的静态文件服务器对没有"从官网页面点进来"的直连请求会返回 403，
     # 带上真实存在的来源页面 referer 更接近浏览器的正常访问路径
     headers = {"Referer": "https://www.rbnz.govt.nz/statistics/series/exchange-and-interest-rates/wholesale-interest-rates"}
+    getters = [
+        ("TLS 指纹伪装", http_get_impersonate),
+        ("普通请求", http_get),
+    ]
     for url in RBNZ_URLS:
-        try:
-            return _clean(_rbnz_2y(http_get(url, headers=headers).content), start)
-        except Exception as e:
-            errors.append(f"{url.rsplit('/', 1)[-1]}: {type(e).__name__}: {str(e)[:160]}")
-    raise ValueError("新西兰联储数据获取失败：" + " | ".join(errors))
+        for g_label, getter in getters:
+            try:
+                return _clean(_rbnz_2y(getter(url, headers=headers).content), start)
+            except Exception as e:
+                errors.append(f"{url.rsplit('/', 1)[-1]}/{g_label}: {type(e).__name__}: {str(e)[:160]}")
+    raise ValueError("新西兰联储数据获取失败：" + " | ".join(errors[:6]))
+
+
+# ---------------------------------------------------------------------------
+# 瑞士 / 新西兰的第三方兜底：Investing.com 历史数据页
+# 官网直连在云端环境下被拦截（见上面两个函数），干脆换一个完全不同的数据源，
+# 不用再跟央行网站的反爬机制纠缠。Investing.com 用 Cloudflare 防爬，用普通
+# requests 大概率还是会被拦截，所以这里同样用 http_get_impersonate（TLS 指纹
+# 伪装成真实 Chrome）去请求；表格用 pandas.read_html 解析，不依赖具体的
+# CSS class（页面改版也不容易失效）。
+# ---------------------------------------------------------------------------
+def _fetch_investing_bond_2y(url: str, start: date) -> pd.Series:
+    resp = http_get_impersonate(
+        url, timeout=30,
+        headers={"Referer": "https://www.investing.com/", "Accept-Language": "en-US,en;q=0.9"},
+    )
+    tables = pd.read_html(io.StringIO(resp.text))
+    for df in tables:
+        cols = [str(c).strip().lower() for c in df.columns]
+        if "date" not in cols:
+            continue
+        price_col_name = next((c for c in ("price", "close") if c in cols), None)
+        if price_col_name is None:
+            continue
+        date_col = df.columns[cols.index("date")]
+        price_col = df.columns[cols.index(price_col_name)]
+        idx = pd.to_datetime(df[date_col], errors="coerce", format="mixed")
+        vals = pd.to_numeric(
+            df[price_col].astype(str).str.replace(",", "", regex=False), errors="coerce"
+        )
+        ok = (idx.notna() & vals.notna()).values
+        if ok.sum() > 3:
+            return _clean(pd.Series(vals.values[ok], index=idx.values[ok]), start)
+    raise ValueError(f"页面里没有找到日期+价格的历史数据表格（共 {len(tables)} 个表格）")
+
+
+def fetch_ch_investing(start: date) -> pd.Series:
+    url = "https://www.investing.com/rates-bonds/switzerland-2-year-bond-yield-historical-data"
+    try:
+        return _fetch_investing_bond_2y(url, start)
+    except Exception as e:
+        raise ValueError(f"Investing.com 瑞士 2 年期数据获取失败：{type(e).__name__}: {str(e)[:160]}")
+
+
+def fetch_nz_investing(start: date) -> pd.Series:
+    url = "https://www.investing.com/rates-bonds/new-zealand-2-years-bond-yield-historical-data"
+    try:
+        return _fetch_investing_bond_2y(url, start)
+    except Exception as e:
+        raise ValueError(f"Investing.com 新西兰 2 年期数据获取失败：{type(e).__name__}: {str(e)[:160]}")
 
 
 # ---------------------------------------------------------------------------
@@ -470,8 +556,10 @@ YIELD_SOURCES: dict[str, list[tuple[str, Callable[[date], pd.Series]]]] = {
     "AU": [("澳洲联储 F2", fetch_au_rba)],
     "CA": [("加拿大央行 Valet", fetch_ca_boc)],
     "CH": [("瑞士央行数据门户", fetch_ch_snb),
+           ("Investing.com（第三方兜底）", fetch_ch_investing),
            ("瑞士央行（GitHub Actions 中转缓存）", fetch_relay_cache("CH"))],
     "NZ": [("新西兰联储 B2", fetch_nz_rbnz),
+           ("Investing.com（第三方兜底）", fetch_nz_investing),
            ("新西兰联储 B2（GitHub Actions 中转缓存）", fetch_relay_cache("NZ"))],
     "SE": [("瑞典央行 SWEA", fetch_se_riksbank)],
     "NO": [("挪威央行（3Y 通用收益率）", fetch_no_norgesbank)],
