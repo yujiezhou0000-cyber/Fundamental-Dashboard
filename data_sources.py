@@ -430,6 +430,33 @@ def fetch_no_norgesbank(start: date) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
+# 中转缓存：实测瑞士央行 / 新西兰联储会拦截 Streamlit Cloud 这类云主机的出口 IP
+# （瑞士表现为"接口正常返回但没有数据行"，新西兰表现为"403 Forbidden"），
+# 但完全相同的抓取逻辑在别的网络环境下工作正常——说明是对方的反爬机制按 IP
+# 段拦截，不是代码问题，改请求头/重试也无法绕过。
+# 于是用 GitHub Actions（网络环境和 Streamlit Cloud 不同）定时跑一次同样的
+# 抓取函数（见 scripts/fetch_blocked_yields.py），把结果提交进仓库的
+# cache/blocked_yields.json，这里再通过 GitHub 的静态文件 CDN
+# raw.githubusercontent.com 读取——不再直连官网，自然也不会被拦截。
+# 注册在 YIELD_SOURCES 里作为"官网直连"失败后的下一个兜底数据源，逻辑
+# 和 US/DE 已有的多数据源自动切换完全一样，不需要额外的特殊分支。
+# ---------------------------------------------------------------------------
+RELAY_CACHE_URL = ("https://raw.githubusercontent.com/"
+                    "yujiezhou0000-cyber/fundamental-dashboard/main/cache/blocked_yields.json")
+
+
+def fetch_relay_cache(code: str) -> Callable[[date], pd.Series]:
+    def _fetch(start: date) -> pd.Series:
+        payload = http_get(RELAY_CACHE_URL, timeout=20).json()
+        entry = payload.get(code)
+        if not entry or not entry.get("dates"):
+            raise ValueError(f"中转缓存里暂时没有 {code} 的数据（可能 GitHub Actions 还没跑成功过一次）")
+        s = pd.Series(entry["values"], index=pd.to_datetime(entry["dates"]))
+        return _clean(s, start)
+    return _fetch
+
+
+# ---------------------------------------------------------------------------
 # 数据源注册表：按顺序尝试
 # ---------------------------------------------------------------------------
 YIELD_SOURCES: dict[str, list[tuple[str, Callable[[date], pd.Series]]]] = {
@@ -442,8 +469,10 @@ YIELD_SOURCES: dict[str, list[tuple[str, Callable[[date], pd.Series]]]] = {
     "JP": [("日本财务省", fetch_jp_mof)],
     "AU": [("澳洲联储 F2", fetch_au_rba)],
     "CA": [("加拿大央行 Valet", fetch_ca_boc)],
-    "CH": [("瑞士央行数据门户", fetch_ch_snb)],
-    "NZ": [("新西兰联储 B2", fetch_nz_rbnz)],
+    "CH": [("瑞士央行数据门户", fetch_ch_snb),
+           ("瑞士央行（GitHub Actions 中转缓存）", fetch_relay_cache("CH"))],
+    "NZ": [("新西兰联储 B2", fetch_nz_rbnz),
+           ("新西兰联储 B2（GitHub Actions 中转缓存）", fetch_relay_cache("NZ"))],
     "SE": [("瑞典央行 SWEA", fetch_se_riksbank)],
     "NO": [("挪威央行（3Y 通用收益率）", fetch_no_norgesbank)],
 }
