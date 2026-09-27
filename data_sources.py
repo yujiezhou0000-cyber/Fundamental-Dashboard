@@ -2,8 +2,8 @@
 数据获取层：各国 2 年期国债收益率（官方接口）+ G10 汇率（yfinance）。
 
 设计要点：
-1. 每个国家配置一个“数据源列表”，按顺序尝试，前一个失败自动换下一个；
-2. 每个抓取函数都包在 try/except 里，任何一个接口断连只会让该国显示为“获取失败”，
+1. 每个国家配置一个"数据源列表"，按顺序尝试，前一个失败自动换下一个；
+2. 每个抓取函数都包在 try/except 里，任何一个接口断连只会让该国显示为"获取失败"，
    不会让整个程序崩溃；
 3. 所有函数统一返回 pandas.Series：索引为日期（Timestamp，已排序去重），值为收益率（%）。
 """
@@ -31,7 +31,8 @@ _session.headers.update(HTTP_HEADERS)
 
 def http_get(url: str, **kwargs) -> requests.Response:
     """带超时和状态码检查的 GET 请求，失败直接抛异常，由上层捕获。"""
-    resp = _session.get(url, timeout=HTTP_TIMEOUT, **kwargs)
+    timeout = kwargs.pop("timeout", HTTP_TIMEOUT)
+    resp = _session.get(url, timeout=timeout, **kwargs)
     resp.raise_for_status()
     return resp
 
@@ -120,7 +121,7 @@ def parse_sdmx_json(js: dict) -> pd.Series:
 
 
 def _parse_date_value_lines(text: str, sep: str = ",") -> pd.Series:
-    """解析“日期,数值,...”格式的行，跳过元数据行（德国央行 CSV 前几行是说明）。"""
+    """解析"日期,数值,..."格式的行，跳过元数据行（德国央行 CSV 前几行是说明）。"""
     dates, vals = [], []
     for line in text.splitlines():
         parts = [p.strip().strip('"') for p in line.split(sep)]
@@ -166,20 +167,25 @@ BOE_ZIPS = [
 
 def _boe_spot_2y_from_xlsx(content: bytes) -> pd.Series:
     sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
-    name = next((n for n in sheets if "spot" in n.lower()), None)
-    if name is None:
-        raise ValueError("文件里没有 spot curve 工作表")
-    raw = sheets[name]
-    # 找到期限表头行：该行中能找到数值 2（年）
-    for r in range(min(15, len(raw))):
-        row = pd.to_numeric(raw.iloc[r], errors="coerce")
-        hits = np.where(np.isclose(row.values.astype(float), 2.0, equal_nan=False))[0]
-        if len(hits) and row.notna().sum() > 5:
-            col = hits[0]
-            body = raw.iloc[r + 1:, [0, col]].dropna()
-            body = body[pd.to_datetime(body.iloc[:, 0], errors="coerce", format="mixed").notna()]
-            return pd.Series(body.iloc[:, 1].values, index=pd.to_datetime(body.iloc[:, 0], format="mixed"))
-    raise ValueError("找不到 2 年期所在的列")
+    # 工作表名可能是 "4. spot curve"、"spot, forward and par yields" 等，只要求含 "spot"
+    names = [n for n in sheets if "spot" in n.lower()]
+    if not names:
+        raise ValueError(f"文件里没有 spot curve 工作表，现有工作表：{list(sheets)[:6]}")
+    errors = []
+    for name in names:
+        raw = sheets[name]
+        # 找到期限表头行：该行中能找到数值 2（年）
+        for r in range(min(20, len(raw))):
+            row = pd.to_numeric(raw.iloc[r], errors="coerce")
+            hits = np.where(np.isclose(row.values.astype(float), 2.0, equal_nan=False))[0]
+            if len(hits) and row.notna().sum() > 5:
+                col = hits[0]
+                body = raw.iloc[r + 1:, [0, col]].dropna()
+                body = body[pd.to_datetime(body.iloc[:, 0], errors="coerce", format="mixed").notna()]
+                if len(body) > 5:
+                    return pd.Series(body.iloc[:, 1].values, index=pd.to_datetime(body.iloc[:, 0], format="mixed"))
+        errors.append(f"{name}: 找不到 2 年期所在的列")
+    raise ValueError(" | ".join(errors))
 
 
 def fetch_gb_boe(start: date) -> pd.Series:
@@ -187,15 +193,21 @@ def fetch_gb_boe(start: date) -> pd.Series:
     for url in BOE_ZIPS:
         try:
             zf = zipfile.ZipFile(io.BytesIO(http_get(url).content))
-            for n in zf.namelist():
-                low = n.lower()
-                if "nominal" in low and "daily" in low and low.endswith((".xlsx", ".xls")):
-                    try:
-                        parts.append(_boe_spot_2y_from_xlsx(zf.read(n)))
-                    except Exception as e:  # 单个文件解析失败不影响其他文件
-                        errors.append(f"{n}: {e}")
+            # 只要文件名包含 "nominal"（名义利率曲线）即可，不再强制要求出现 "daily"，
+            # 因为压缩包内部命名可能随版本变化（如 "GLC Nominal daily data_...xlsx"、
+            # "GLC Nominal month end data..."），宁可多尝试几个文件也不要因为命名差异整体失败。
+            candidates = [n for n in zf.namelist()
+                          if "nominal" in n.lower() and n.lower().endswith((".xlsx", ".xls"))]
+            if not candidates:
+                errors.append(f"{url}: 压缩包内没有名称含 nominal 的 xlsx/xls 文件，实际文件：{zf.namelist()[:8]}")
+                continue
+            for n in candidates:
+                try:
+                    parts.append(_boe_spot_2y_from_xlsx(zf.read(n)))
+                except Exception as e:  # 单个文件解析失败不影响其他文件
+                    errors.append(f"{n}: {e}")
         except Exception as e:
-            errors.append(f"{url}: {e}")
+            errors.append(f"{url}: {type(e).__name__}: {e}")
     if not parts:
         raise ValueError("英国央行数据解析失败：" + " | ".join(errors[:3]))
     return _clean(pd.concat(parts), start)
@@ -233,18 +245,47 @@ def fetch_jp_mof(start: date) -> pd.Series:
 
 # ---------------------------------------------------------------------------
 # 澳大利亚：澳洲联储 F2 表（FCMYGBAG2 = 2 年期国债）
+# 2024 年前后 RBA 把该表由 F2 改名为 F2.1，下载地址随之从 f2-data.csv 变成
+# f2.1-data.csv；新地址放前面优先尝试，旧地址留作兜底。
 # ---------------------------------------------------------------------------
+RBA_URLS = [
+    "https://www.rba.gov.au/statistics/tables/csv/f2.1-data.csv",
+    "https://www.rba.gov.au/statistics/tables/csv/f2-data.csv",
+]
+RBA_SERIES_CANDIDATES = ["FCMYGBAG2", "FCMYGBAG2Y", "FCMYGBAG02"]
+
+
 def fetch_au_rba(start: date) -> pd.Series:
-    url = "https://www.rba.gov.au/statistics/tables/csv/f2-data.csv"
-    text = http_get(url).content.decode("utf-8", errors="replace")
-    lines = text.splitlines()
-    h = _find_header_line(lines, ["Series ID"])
-    df = pd.read_csv(io.StringIO("\n".join(lines[h:])))
-    col = "FCMYGBAG2" if "FCMYGBAG2" in df.columns else None
-    if col is None:
-        raise ValueError(f"找不到 FCMYGBAG2 列，现有列：{list(df.columns)[:8]}")
-    idx = pd.to_datetime(df.iloc[:, 0], format="%d-%b-%Y", errors="coerce")
-    return _clean(pd.Series(df[col].values, index=idx).loc[idx.notna().values], start)
+    errors = []
+    for url in RBA_URLS:
+        try:
+            text = http_get(url).content.decode("utf-8", errors="replace")
+            lines = text.splitlines()
+            h = _find_header_line(lines, ["Series ID"])
+            df = pd.read_csv(io.StringIO("\n".join(lines[h:])))
+            col = next((c for c in RBA_SERIES_CANDIDATES if c in df.columns), None)
+            if col is None:
+                # 退而求其次：在"Series ID"行之前的说明行里（Title/Description 等）
+                # 按列位置找到描述含"2-year"且含 government bond 字样的列
+                target_idx = None
+                for raw_line in lines[:h]:
+                    cells = raw_line.split(",")
+                    for i, cell in enumerate(cells):
+                        low = cell.strip().strip('"').lower()
+                        if re.search(r"\b2[\s-]*year", low) and re.search(r"government|govt", low) and "bond" in low:
+                            target_idx = i
+                            break
+                    if target_idx is not None:
+                        break
+                if target_idx is not None and target_idx < len(df.columns):
+                    col = df.columns[target_idx]
+            if col is None:
+                raise ValueError(f"找不到 2 年期国债列，现有列：{list(df.columns)[:8]}")
+            idx = pd.to_datetime(df.iloc[:, 0], format="%d-%b-%Y", errors="coerce")
+            return _clean(pd.Series(df[col].values, index=idx).loc[idx.notna().values], start)
+        except Exception as e:
+            errors.append(f"{url.rsplit('/', 1)[-1]}: {type(e).__name__}: {e}")
+    raise ValueError("澳大利亚联储数据获取失败：" + " | ".join(errors))
 
 
 # ---------------------------------------------------------------------------
@@ -261,14 +302,26 @@ def fetch_ca_boc(start: date) -> pd.Series:
 # 瑞士：瑞士央行数据门户 rendoblid（联邦债券收益率，日度）
 # ---------------------------------------------------------------------------
 def fetch_ch_snb(start: date) -> pd.Series:
-    """瑞士央行 rendoblid。实测带 fromDate 的请求可能返回空序列，所以空了就不带日期再取一次。"""
+    """瑞士央行 rendoblid。实测带 fromDate 的请求可能返回空序列，所以再试一次限定到
+    最近 3 年（数据量小、不易超时），最后才尝试不带日期的全量（1988 年至今，体积较大，
+    云端环境下可能因为超时或限流失败）。"""
     errors = []
-    for url in (f"https://data.snb.ch/api/cube/rendoblid/data/csv/en?fromDate={start:%Y-%m-%d}",
-                "https://data.snb.ch/api/cube/rendoblid/data/csv/en"):
+    bounded_from = max(start, date.today() - timedelta(days=3 * 365))
+    attempts = [
+        ("按起始日期", f"https://data.snb.ch/api/cube/rendoblid/data/csv/en?fromDate={start:%Y-%m-%d}"),
+        ("近三年", f"https://data.snb.ch/api/cube/rendoblid/data/csv/en?fromDate={bounded_from:%Y-%m-%d}"),
+        ("全量", "https://data.snb.ch/api/cube/rendoblid/data/csv/en"),
+    ]
+    seen_urls = set()
+    for label, url in attempts:
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
         try:
-            return _clean(_parse_snb_csv(http_get(url).content.decode("utf-8-sig", errors="replace")), start)
+            resp = http_get(url, timeout=40)
+            return _clean(_parse_snb_csv(resp.content.decode("utf-8-sig", errors="replace")), start)
         except Exception as e:
-            errors.append(f"{url.split('?')[-1] if '?' in url else '全量'}: {e}")
+            errors.append(f"{label}: {type(e).__name__}: {str(e)[:120]}")
     raise ValueError("瑞士央行数据为空或解析失败：" + " | ".join(errors))
 
 
@@ -299,12 +352,24 @@ RBNZ_URLS = [
 
 def _rbnz_2y(content: bytes) -> pd.Series:
     raw = pd.read_excel(io.BytesIO(content), sheet_name=0, header=None)
-    head = raw.head(12).astype(str).apply(lambda c: " ".join(c).lower())
-    # 表头里同时出现 “2 year” 和 “bond / govt” 的那一列
+    # RBNZ 2025-08-25 起改用新数据源并合并了文件，表头经常是合并单元格
+    # (比如 "Secondary market government bond closing yields" 只写在最左一格，
+    # 右侧 1/2/5/10 年各列在原始表里是空的)。ffill 把合并单元格的说明文字
+    # 沿着列方向补全，再按列拼出完整表头文本。
+    head_block = raw.head(15).ffill(axis=1)
+    # 用生成器逐个 str() 而不是 .astype(str)：某些 pandas 版本的字符串扩展类型
+    # 在 astype(str) 后仍把缺失值留成 float('nan')，直接 join 会抛 TypeError
+    head = head_block.apply(lambda c: ' '.join(str(x) for x in c).lower())
+    # 表头里同时出现 2-year 和 bond/govt 字样的那一列
     cand = [i for i, t in head.items()
-            if re.search(r"\b2[\s-]*(year|yr)", t) and re.search(r"bond|govt|government", t)]
+            if re.search(r'\b2[\s-]*(year|yr)\b', t) and re.search(r'bond|govt|government', t)]
     if not cand:
-        raise ValueError("找不到政府债券 2 年期所在的列")
+        # 退而求其次：只要求该列自己的表头含 2-year，且整张表头文本里出现过政府债券字样
+        whole = ' '.join(head.values)
+        if re.search(r'bond|govt|government', whole):
+            cand = [i for i, t in head.items() if re.search(r'\b2[\s-]*(year|yr)\b', t)]
+    if not cand:
+        raise ValueError('找不到政府债券 2 年期所在的列，表头片段：' + str(list(head.values)[:6]))
     col = cand[0]
     idx = pd.to_datetime(raw.iloc[:, 0], errors="coerce", format="mixed")
     ok = idx.notna().values
@@ -406,7 +471,7 @@ def load_all_yields(start: date) -> dict[str, YieldResult]:
 
 
 # ---------------------------------------------------------------------------
-# 汇率（yfinance）：换算成“1 单位该货币值多少美元”
+# 汇率（yfinance）：换算成"1 单位该货币值多少美元"
 # ---------------------------------------------------------------------------
 def load_fx_usd_values(start: date) -> tuple[pd.DataFrame, dict[str, str]]:
     import yfinance as yf
